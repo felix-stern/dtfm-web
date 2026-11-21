@@ -372,7 +372,7 @@
     if (fmt === "json") {
       return { format: "json", dom: snapshot };
     }
-    return { format: "md", markdown: formatDOMAsMarkdown(snapshot), dom: snapshot };
+    return { format: "md", markdown: formatDOMAsMarkdown(snapshot) };
   }
 
   // Expose for chrome.scripting.executeScript and Node tests.

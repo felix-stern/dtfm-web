@@ -26,6 +26,7 @@ import {
 } from "./e2ee.js";
 
 const KEEPALIVE_INTERVAL_MS = 20_000;
+const WS_CONNECT_TIMEOUT_MS = 10_000;
 const STORAGE_RELAY_URL_KEY = "dtfm_web_relay_url";
 
 const state = {
@@ -44,9 +45,51 @@ const state = {
   hk: null,
   ws: null,
   keepaliveTimer: null,
-  activeAgent: null, // { connID: bigint, opNonce: Uint8Array, cipher: ConnCipher|null, chain: Promise }
+  connectTimer: null,
+  pendingFinish: null,
+  activeAgent: null, // { connID: bigint, opNonce: Uint8Array|null, cipher: ConnCipher|null, chain: Promise }
   lastError: null,
 };
+
+function isLoopbackHostname(hostname) {
+  const host = (hostname || "").toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+}
+
+function validateRelayUrl(rawUrl) {
+  const normalized = (rawUrl || DEFAULT_RELAY_WS_URL).trim();
+  const parsed = new URL(normalized);
+  if (parsed.protocol === "wss:") {
+    return normalized;
+  }
+  if (parsed.protocol === "ws:") {
+    if (isLoopbackHostname(parsed.hostname)) {
+      return normalized;
+    }
+    throw new Error("Unencrypted ws:// relay is only allowed for loopback hosts (localhost, 127.0.0.1, ::1); use wss://");
+  }
+  throw new Error("Relay URL must use wss:// (or ws:// for localhost)");
+}
+
+function isPinnedOrigin(tab) {
+  if (!tab || typeof tab.url !== "string" || !state.origin) {
+    return false;
+  }
+  try {
+    return new URL(tab.url).origin === state.origin;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function revokeOriginPermission(originPattern) {
+  if (!originPattern) return;
+  try {
+    await chrome.permissions.remove({ origins: [originPattern] });
+  } catch (_) {
+    // Permission may have already been revoked.
+  }
+}
 
 async function loadSavedRelayUrl() {
   try {
@@ -107,13 +150,19 @@ async function stopSharing(reason = null) {
   const prevTabId = state.tabId;
   const prevOriginPattern = state.originPattern;
   const prevWs = state.ws;
+  const prevFinish = state.pendingFinish;
 
   if (state.keepaliveTimer !== null) {
     clearInterval(state.keepaliveTimer);
     state.keepaliveTimer = null;
   }
+  if (state.connectTimer !== null) {
+    clearTimeout(state.connectTimer);
+    state.connectTimer = null;
+  }
 
   state.ws = null;
+  state.pendingFinish = null;
   state.active = false;
   state.connected = false;
   state.tabId = null;
@@ -145,13 +194,10 @@ async function stopSharing(reason = null) {
   }
 
   await clearLiveBadge(prevTabId);
+  await revokeOriginPermission(prevOriginPattern);
 
-  if (prevOriginPattern) {
-    try {
-      await chrome.permissions.remove({ origins: [prevOriginPattern] });
-    } catch (_) {
-      // Permission may have already been revoked.
-    }
+  if (prevFinish) {
+    prevFinish();
   }
 }
 
@@ -186,6 +232,16 @@ async function handleAgentRequest(req) {
     };
   }
 
+  // Enforce strict single-origin pinning across all commands (status, dom, shot).
+  if (!isPinnedOrigin(tab)) {
+    return {
+      id,
+      ok: false,
+      error_code: "ERR_PERMISSION_DENIED",
+      error: `Shared tab navigated away from pinned origin (${state.origin})`,
+    };
+  }
+
   state.tabTitle = tab.title || "";
   state.tabUrl = tab.url || "";
 
@@ -217,6 +273,37 @@ async function handleAgentRequest(req) {
 
     try {
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+
+      // Post-capture TOCTOU check: ensure tab is still active and on the pinned origin.
+      let postTab;
+      try {
+        postTab = await chrome.tabs.get(state.tabId);
+      } catch (_) {
+        await stopSharing("Shared tab was closed");
+        return {
+          id,
+          ok: false,
+          error_code: "ERR_TAB_CLOSED",
+          error: "Shared tab closed during screenshot capture",
+        };
+      }
+      if (!isPinnedOrigin(postTab)) {
+        return {
+          id,
+          ok: false,
+          error_code: "ERR_PERMISSION_DENIED",
+          error: `Shared tab navigated away from pinned origin (${state.origin}) during capture`,
+        };
+      }
+      if (postTab.active !== true) {
+        return {
+          id,
+          ok: false,
+          error_code: "ERR_TAB_NOT_ACTIVE",
+          error: "Shared tab became inactive during capture; discarding screenshot",
+        };
+      }
+
       const prefix = "data:image/png;base64,";
       if (!dataUrl || !dataUrl.startsWith(prefix)) {
         return {
@@ -245,22 +332,6 @@ async function handleAgentRequest(req) {
   if (cmd === "dom") {
     const format = req.format === "json" ? "json" : "md";
 
-    // Enforce strict single-origin pinning: refuse if tab navigated away from granted origin.
-    let currentOrigin = "";
-    try {
-      currentOrigin = new URL(tab.url || "").origin;
-    } catch (_) {
-      currentOrigin = "";
-    }
-    if (!currentOrigin || currentOrigin !== state.origin) {
-      return {
-        id,
-        ok: false,
-        error_code: "ERR_PERMISSION_DENIED",
-        error: `Shared tab navigated away from pinned origin (${state.origin})`,
-      };
-    }
-
     try {
       await chrome.scripting.executeScript({
         target: { tabId: state.tabId },
@@ -285,12 +356,19 @@ async function handleAgentRequest(req) {
           error: "DOM extractor returned empty result",
         };
       }
+      if (extracted.format === "json") {
+        return {
+          id,
+          ok: true,
+          format: "json",
+          dom: extracted.dom,
+        };
+      }
       return {
         id,
         ok: true,
-        format: extracted.format,
+        format: "md",
         markdown: extracted.markdown || "",
-        dom: extracted.dom,
       };
     } catch (err) {
       return {
@@ -316,6 +394,12 @@ async function processAgentFrame(ws, agent, payload) {
   }
 
   if (!agent.cipher) {
+    if (!agent.opNonce) {
+      if (state.activeAgent === agent) state.activeAgent = null;
+      sendKickAgent(ws, agent.connID);
+      return;
+    }
+
     // First frame from agent must be the 69-byte authenticated handshake packet.
     let agentNonce;
     try {
@@ -323,6 +407,10 @@ async function processAgentFrame(ws, agent, payload) {
     } catch (_) {
       if (state.activeAgent === agent) state.activeAgent = null;
       sendKickAgent(ws, agent.connID);
+      return;
+    }
+
+    if (ws !== state.ws || state.activeAgent !== agent) {
       return;
     }
 
@@ -371,7 +459,7 @@ async function processAgentFrame(ws, agent, payload) {
         ok: false,
         error_code: "ERR_INVALID_REQUEST",
         error: `Malformed JSON request: ${err.message}`,
-      })
+      }) + "\n"
     );
     await sendEncryptedResponse(ws, agent, respBytes);
     return;
@@ -383,7 +471,7 @@ async function processAgentFrame(ws, agent, payload) {
 }
 
 async function sendEncryptedResponse(ws, agent, respBytes) {
-  if (ws !== state.ws || ws.readyState !== WebSocket.OPEN || !agent.cipher) {
+  if (ws !== state.ws || state.activeAgent !== agent || ws.readyState !== WebSocket.OPEN || !agent.cipher) {
     return;
   }
   const encryptedData = await agent.cipher.encryptRecord(RECORD_TYPE_DATA, respBytes);
@@ -393,7 +481,15 @@ async function sendEncryptedResponse(ws, agent, respBytes) {
   ws.send(encodeRelayFrame(FRAME_DATA, agent.connID, encryptedEOF));
 }
 
-async function handleRelayMessage(ws, data) {
+function handleAgentChainError(ws, agent, err) {
+  console.error("[dtfm-web] agent frame error:", err);
+  if (state.activeAgent === agent) {
+    state.activeAgent = null;
+  }
+  sendKickAgent(ws, agent.connID);
+}
+
+function handleRelayMessage(ws, data) {
   if (ws !== state.ws || !(data instanceof ArrayBuffer)) {
     return;
   }
@@ -405,18 +501,28 @@ async function handleRelayMessage(ws, data) {
   const { ctrlByte, connID, payload } = decodeRelayFrame(bytes);
 
   if (ctrlByte === FRAME_AGENT_CONNECTED) {
-    const { opNonce, packet } = await buildOperatorHandshake(state.hk, state.sessionID);
-    if (ws !== state.ws || ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
+    // Synchronously register activeAgent before any await so immediately-arriving
+    // FRAME_DATA(agentHandshake) or FRAME_AGENT_DISCONNECTED frames are never dropped.
     const agent = {
       connID,
-      opNonce,
+      opNonce: null,
       cipher: null,
       chain: Promise.resolve(),
     };
     state.activeAgent = agent;
-    ws.send(encodeRelayFrame(FRAME_DATA, connID, packet));
+    agent.chain = agent.chain
+      .then(async () => {
+        if (ws !== state.ws || state.activeAgent !== agent) {
+          return;
+        }
+        const { opNonce, packet } = await buildOperatorHandshake(state.hk, state.sessionID);
+        if (ws !== state.ws || state.activeAgent !== agent || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        agent.opNonce = opNonce;
+        ws.send(encodeRelayFrame(FRAME_DATA, connID, packet));
+      })
+      .catch((err) => handleAgentChainError(ws, agent, err));
     return;
   }
 
@@ -434,32 +540,48 @@ async function handleRelayMessage(ws, data) {
     }
     // Serialize async crypto & handler operations per agent connection.
     const payloadCopy = new Uint8Array(payload);
-    agent.chain = agent.chain.then(() => processAgentFrame(ws, agent, payloadCopy));
+    agent.chain = agent.chain
+      .then(() => processAgentFrame(ws, agent, payloadCopy))
+      .catch((err) => handleAgentChainError(ws, agent, err));
   }
 }
 
 async function startSharing({ tabId, windowId, tabTitle, tabUrl, origin, relayUrl }) {
   await stopSharing(null);
 
-  const normalizedRelay = (relayUrl || DEFAULT_RELAY_WS_URL).trim();
-  let parsedRelay;
+  const originPattern = origin ? `${origin}/*` : null;
+
+  let normalizedRelay;
   try {
-    parsedRelay = new URL(normalizedRelay);
-    if (parsedRelay.protocol !== "wss:" && parsedRelay.protocol !== "ws:") {
-      throw new Error("Relay URL must use wss:// or ws://");
-    }
+    normalizedRelay = validateRelayUrl(relayUrl);
   } catch (err) {
+    await revokeOriginPermission(originPattern);
     state.lastError = `Invalid relay URL: ${err.message}`;
     return getPublicState();
   }
 
   await saveRelayUrl(normalizedRelay);
 
-  const sessionID = generateSessionID();
-  const { key: secretKey, keyHex } = generateSessionKey();
-  const { opAuth, agentVerifier } = await deriveAuthTokens(secretKey, sessionID);
-  const hk = await handshakeKey(secretKey, sessionID);
-  const authFrame = buildOperatorAuthFrame(opAuth, agentVerifier);
+  let sessionID;
+  let secretKey;
+  let keyHex;
+  let authFrame;
+  let hk;
+  try {
+    sessionID = generateSessionID();
+    const generated = generateSessionKey();
+    secretKey = generated.key;
+    keyHex = generated.keyHex;
+    const { opAuth, agentVerifier } = await deriveAuthTokens(secretKey, sessionID);
+    hk = await handshakeKey(secretKey, sessionID);
+    authFrame = buildOperatorAuthFrame(opAuth, agentVerifier);
+  } catch (err) {
+    if (secretKey) secretKey.fill(0);
+    if (hk) hk.fill(0);
+    await revokeOriginPermission(originPattern);
+    state.lastError = `Failed to initialize E2EE session: ${err.message}`;
+    return getPublicState();
+  }
 
   const wsUrl = new URL(normalizedRelay);
   wsUrl.searchParams.set("session", sessionID);
@@ -472,7 +594,7 @@ async function startSharing({ tabId, windowId, tabTitle, tabUrl, origin, relayUr
   state.tabTitle = tabTitle || "";
   state.tabUrl = tabUrl || "";
   state.origin = origin;
-  state.originPattern = `${origin}/*`;
+  state.originPattern = originPattern;
   state.sessionID = sessionID;
   state.keyHex = keyHex;
   state.secretKey = secretKey;
@@ -480,29 +602,60 @@ async function startSharing({ tabId, windowId, tabTitle, tabUrl, origin, relayUr
   state.activeAgent = null;
   state.lastError = null;
 
-  const ws = new WebSocket(wsUrl.toString());
-  ws.binaryType = "arraybuffer";
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl.toString());
+    ws.binaryType = "arraybuffer";
+  } catch (err) {
+    await stopSharing(`Failed to open relay WebSocket: ${err.message}`);
+    return getPublicState();
+  }
   state.ws = ws;
-
-  await setLiveBadge(tabId);
 
   return new Promise((resolve) => {
     let settled = false;
     const finish = () => {
       if (!settled) {
         settled = true;
+        if (state.pendingFinish === finish) {
+          state.pendingFinish = null;
+        }
         resolve(getPublicState());
       }
     };
+    state.pendingFinish = finish;
+
+    let hadError = false;
+    let timedOut = false;
+
+    state.connectTimer = setTimeout(() => {
+      if (state.ws === ws && ws.readyState !== WebSocket.OPEN) {
+        timedOut = true;
+        try {
+          ws.close();
+        } catch (_) {
+          // Ignore close errors.
+        }
+        stopSharing("Relay WebSocket connection timed out").finally(finish);
+      }
+    }, WS_CONNECT_TIMEOUT_MS);
 
     ws.onopen = () => {
       if (ws !== state.ws) {
         ws.close();
+        finish();
         return;
+      }
+      if (state.connectTimer !== null) {
+        clearTimeout(state.connectTimer);
+        state.connectTimer = null;
       }
       ws.send(authFrame);
       state.connected = true;
       state.lastError = null;
+
+      // Set LIVE badge only once relay connection is established.
+      setLiveBadge(tabId);
 
       // 1-byte keepalive every 20s keeps MV3 service worker awake and refreshes relay idle timer.
       state.keepaliveTimer = setInterval(() => {
@@ -515,23 +668,27 @@ async function startSharing({ tabId, windowId, tabTitle, tabUrl, origin, relayUr
     };
 
     ws.onmessage = (event) => {
-      handleRelayMessage(ws, event.data).catch((err) => {
-        console.error("[dtfm-web] relay message error:", err);
-      });
+      handleRelayMessage(ws, event.data);
     };
 
     ws.onerror = () => {
       if (ws !== state.ws) return;
-      state.lastError = "Relay WebSocket connection failed";
-      finish();
+      hadError = true;
     };
 
     ws.onclose = (event) => {
-      if (ws !== state.ws) return;
-      const reason =
-        event.code === 1000
-          ? null
+      if (ws !== state.ws) {
+        finish();
+        return;
+      }
+      let reason = null;
+      if (timedOut) {
+        reason = "Relay WebSocket connection timed out";
+      } else if (event.code !== 1000) {
+        reason = hadError
+          ? `Relay WebSocket connection failed (code ${event.code})`
           : `Relay disconnected (code ${event.code}${event.reason ? `: ${event.reason}` : ""})`;
+      }
       stopSharing(reason).finally(finish);
     };
   });
@@ -543,7 +700,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Restrict messages strictly to this extension's own UI pages (popup), never content scripts or external senders.
+  if (!sender || sender.id !== chrome.runtime.id || sender.tab) {
+    return;
+  }
+
   (async () => {
     if (!msg || typeof msg.type !== "string") {
       sendResponse({ error: "invalid message" });

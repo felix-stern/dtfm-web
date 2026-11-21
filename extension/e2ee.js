@@ -445,17 +445,21 @@ export async function deriveConnCipher(role, sessionID, secretKey, opNonce, agen
   const agentKeyRaw = await hkdfDeriveBytes(secretKey, salt, utf8Encode("agent-to-operator"), KEY_SIZE);
 
   const subtle = getCrypto().subtle;
-  const opKey = await subtle.importKey("raw", opKeyRaw, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
-  const agentKey = await subtle.importKey("raw", agentKeyRaw, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
+  const isOp = role === ROLE_OPERATOR;
+  const sendKey = await subtle.importKey(
+    "raw",
+    isOp ? opKeyRaw : agentKeyRaw,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"]
+  );
+  const recvKey = await subtle.importKey(
+    "raw",
+    isOp ? agentKeyRaw : opKeyRaw,
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"]
+  );
 
-  if (role === ROLE_OPERATOR) {
-    return new ConnCipher(sessionID, role, opKey, agentKey);
-  }
-  return new ConnCipher(sessionID, role, agentKey, opKey);
+  return new ConnCipher(sessionID, role, sendKey, recvKey);
 }

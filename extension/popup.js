@@ -56,11 +56,34 @@ async function refreshState() {
   renderState(state);
 }
 
+function validateRelayUrl(rawUrl) {
+  const normalized = (rawUrl || "wss://relay.dtfm.dev/ws").trim();
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch (_) {
+    throw new Error("Invalid relay URL");
+  }
+  if (parsed.protocol === "wss:") {
+    return normalized;
+  }
+  if (parsed.protocol === "ws:") {
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1") {
+      return normalized;
+    }
+    throw new Error("Unencrypted ws:// relay is only allowed for loopback hosts (localhost, 127.0.0.1, ::1); use wss://");
+  }
+  throw new Error("Relay URL must use wss:// (or ws:// for localhost)");
+}
+
 shareBtn.addEventListener("click", async () => {
   showError("");
   shareBtn.disabled = true;
 
   try {
+    const relayUrl = validateRelayUrl(relayUrlInput.value);
+
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab || typeof tab.id !== "number" || !tab.url) {
       throw new Error("No active HTTP(S) tab found");
@@ -93,7 +116,7 @@ shareBtn.addEventListener("click", async () => {
       tabTitle: tab.title || "",
       tabUrl: tab.url,
       origin,
-      relayUrl: relayUrlInput.value.trim(),
+      relayUrl,
     });
     renderState(state);
   } catch (err) {

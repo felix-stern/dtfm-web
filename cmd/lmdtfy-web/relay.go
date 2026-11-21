@@ -216,6 +216,9 @@ func DoRequest(relayWsURL, sessionID string, secretKey []byte, req webproto.Requ
 
 		switch recType {
 		case e2ee.RecordTypeData:
+			if respBuf.Len()+len(plaintext) > maxWSReadBytes {
+				return nil, &RelayError{Code: 1, Message: "response exceeds maximum allowed size"}
+			}
 			respBuf.Write(plaintext)
 			if bytes.Contains(respBuf.Bytes(), []byte("\n")) {
 				goto decodeResp

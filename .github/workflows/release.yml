@@ -170,7 +170,7 @@ jobs:
       - name: Package Chrome MV3 extension zip
         run: |
           ext_zip="artifacts/dtfm-web-extension-${TAG}.zip"
-          (cd extension && zip -r -X "../${ext_zip}" . -x "test/*" "test/**")
+          (cd extension && zip -r -X "../${ext_zip}" . -x "test" "test/*")
           unzip -l "${ext_zip}"
 
       - name: Generate and verify SHA256SUMS

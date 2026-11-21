@@ -292,4 +292,5 @@ test("DOM extraction: label resolution, password redaction, hidden field omissio
   const mdRes = runExtract("md", doc);
   assert.equal(mdRes.format, "md");
   assert.equal(mdRes.markdown, md);
+  assert.equal("dom" in mdRes, false);
 });
