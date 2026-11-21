@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    .bg { fill: #ffffff; }
+    .ibeam { stroke: #1f2328; }
+    .blue { stroke: #0088d1; fill: rgba(0, 136, 209, 0.20); }
+    .orange { stroke: #e06300; fill: rgba(224, 99, 0, 0.20); }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .ibeam { stroke: #e6edf3; }
+      .blue { stroke: #00A8FF; fill: rgba(0, 168, 255, 0.24); }
+      .orange { stroke: #FF7A00; fill: rgba(255, 122, 0, 0.24); }
+    }
+  </style>
+  <rect class="bg" width="32" height="32" rx="7"/>
+  <ellipse class="blue" cx="7.2" cy="16" rx="5.0" ry="8.2" stroke-width="2.3"/>
+  <path class="ibeam" d="M16 5.5v21M14.2 6.2h3.6M14.2 25.8h3.6" stroke-width="2.1" stroke-linecap="round"/>
+  <ellipse class="orange" cx="24.8" cy="16" rx="5.0" ry="8.2" stroke-width="2.3"/>
+</svg>

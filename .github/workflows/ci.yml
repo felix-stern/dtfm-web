@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    if: github.repository == 'iinozemtsev-lab/dtfm-web' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify Go modules
+        run: go mod verify
+
+      - name: Check formatting (gofmt)
+        run: |
+          diffs=$(gofmt -s -d .)
+          if [ -n "$diffs" ]; then
+            echo "Unformatted Go files detected:"
+            echo "$diffs"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run JS WebCrypto & DOM tests
+        run: node --test extension/test/e2ee.test.mjs extension/test/content.test.mjs
+
+      - name: Run Go unit, race & cross-language E2EE tests
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          TMPDIR: /tmp
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            go test -v -race -ldflags="-linkmode=external" ./...
+          else
+            go test -v -race ./...
+          fi
+
+      - name: Build local static binary
+        run: make build
+
+  cross-compile:
+    name: Cross-Compile & Static ELF Verification
+    if: github.repository == 'iinozemtsev-lab/dtfm-web' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Cross-compile lmdtfy-web
+        run: make cross
+
+      - name: Verify static ELF linkage (Linux targets)
+        run: |
+          for bin in bin/dist/lmdtfy-web-linux-amd64 bin/dist/lmdtfy-web-linux-arm64; do
+            if [ ! -f "$bin" ]; then
+              echo "Error: missing artifact $bin" >&2
+              exit 1
+            fi
+            if readelf -l "$bin" | grep -E 'INTERP|DYNAMIC' >/dev/null; then
+              echo "Error: $bin is not statically linked!" >&2
+              exit 1
+            fi
+            echo "✓ Verified static ELF binary: $bin"
+          done
