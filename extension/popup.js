@@ -39,7 +39,7 @@ function renderState(state) {
       statusBadge.className = "badge reconnecting";
     } else {
       statusBadge.textContent = "CONNECTING";
-      statusBadge.className = "badge live";
+      statusBadge.className = "badge reconnecting";
     }
     idleView.classList.add("hidden");
     liveView.classList.remove("hidden");

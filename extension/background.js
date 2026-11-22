@@ -242,7 +242,7 @@ async function clearWatchdogAlarm() {
   }
 }
 
-async function stopSharing(reason = null) {
+async function stopSharingInternal(reason = null) {
   state.connGen += 1;
   const prevTabId = state.tabId;
   const prevOriginPattern = state.originPattern;
@@ -293,6 +293,10 @@ async function stopSharing(reason = null) {
   }
 
   if (prevWs) {
+    prevWs.onopen = null;
+    prevWs.onclose = null;
+    prevWs.onerror = null;
+    prevWs.onmessage = null;
     try {
       prevWs.close(1000, "operator stopped sharing");
     } catch (_) {
@@ -308,6 +312,14 @@ async function stopSharing(reason = null) {
   if (prevFinish) {
     prevFinish();
   }
+}
+
+async function stopSharing(reason = null) {
+  state.connGen += 1;
+  if (restoreInFlight) {
+    await restoreInFlight.catch(() => {});
+  }
+  await stopSharingInternal(reason);
 }
 
 function sendKickAgent(ws, connID) {
@@ -707,6 +719,10 @@ function scheduleReconnect(gen) {
 }
 
 function openRelaySocket({ isInitial = false } = {}) {
+  if (!state.active || !state.sessionID) {
+    return Promise.resolve(getPublicState());
+  }
+
   state.connGen += 1;
   const gen = state.connGen;
 
@@ -765,7 +781,12 @@ function openRelaySocket({ isInitial = false } = {}) {
       if (gen !== state.connGen || !state.active || state.ws !== ws || ws.readyState === WebSocket.OPEN) {
         return;
       }
-      timedOut = true;
+      state.connectTimer = null;
+      state.ws = null;
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
       try {
         ws.close();
       } catch (_) {
@@ -940,6 +961,9 @@ export async function ensureRestored() {
   }
 
   restoreInFlight = (async () => {
+    const gen = state.connGen;
+    const isAborted = () => state.connGen !== gen || state.active;
+
     if (state.active) {
       if (
         !state.connected &&
@@ -962,38 +986,64 @@ export async function ensureRestored() {
     } catch (_) {
       return getPublicState();
     }
+    if (isAborted()) {
+      return getPublicState();
+    }
 
     const saved = data?.[STORAGE_SESSION_KEY];
+    let normalizedRelay = null;
+    if (saved && typeof saved.relayUrl === "string") {
+      try {
+        normalizedRelay = validateRelayUrl(saved.relayUrl);
+      } catch (_) {
+        normalizedRelay = null;
+      }
+    }
     if (
       !saved ||
       typeof saved.tabId !== "number" ||
       typeof saved.sessionID !== "string" ||
       typeof saved.keyHex !== "string" ||
-      typeof saved.relayUrl !== "string"
+      typeof saved.origin !== "string" ||
+      saved.origin.length === 0 ||
+      saved.originPattern !== `${saved.origin}/*` ||
+      !normalizedRelay
     ) {
+      if (saved) {
+        await clearSessionStorage();
+      }
       return getPublicState();
     }
 
     try {
       await chrome.tabs.get(saved.tabId);
     } catch (_) {
+      if (isAborted()) {
+        return getPublicState();
+      }
       state.tabId = saved.tabId;
-      state.originPattern = saved.originPattern || null;
-      await stopSharing("Shared tab was closed");
+      state.originPattern = saved.originPattern;
+      await stopSharingInternal("Shared tab was closed");
+      return getPublicState();
+    }
+    if (isAborted()) {
       return getPublicState();
     }
 
-    if (saved.originPattern && chrome?.permissions?.contains) {
+    if (chrome?.permissions?.contains) {
       let hasPerm = false;
       try {
         hasPerm = await chrome.permissions.contains({ origins: [saved.originPattern] });
       } catch (_) {
         hasPerm = false;
       }
+      if (isAborted()) {
+        return getPublicState();
+      }
       if (!hasPerm) {
         state.tabId = saved.tabId;
         state.originPattern = saved.originPattern;
-        await stopSharing("Host permission was revoked");
+        await stopSharingInternal("Host permission was revoked");
         return getPublicState();
       }
     }
@@ -1001,17 +1051,32 @@ export async function ensureRestored() {
     let secretKey;
     let hk;
     let authFrame;
+    const zeroizeLocals = () => {
+      if (secretKey) secretKey.fill(0);
+      if (hk) hk.fill(0);
+      if (authFrame) authFrame.fill(0);
+    };
     try {
       secretKey = hexToBytes(saved.keyHex);
       const { opAuth, agentVerifier } = await deriveAuthTokens(secretKey, saved.sessionID);
+      if (isAborted()) {
+        zeroizeLocals();
+        return getPublicState();
+      }
       hk = await handshakeKey(secretKey, saved.sessionID);
+      if (isAborted()) {
+        zeroizeLocals();
+        return getPublicState();
+      }
       authFrame = buildOperatorAuthFrame(opAuth, agentVerifier);
     } catch (_) {
-      if (secretKey) secretKey.fill(0);
-      if (hk) hk.fill(0);
+      zeroizeLocals();
+      if (isAborted()) {
+        return getPublicState();
+      }
       state.tabId = saved.tabId;
-      state.originPattern = saved.originPattern || null;
-      await stopSharing("Failed to restore E2EE session");
+      state.originPattern = saved.originPattern;
+      await stopSharingInternal("Failed to restore E2EE session");
       return getPublicState();
     }
 
@@ -1023,9 +1088,9 @@ export async function ensureRestored() {
     state.windowId = saved.windowId ?? null;
     state.tabTitle = saved.tabTitle || "";
     state.tabUrl = saved.tabUrl || "";
-    state.origin = saved.origin || null;
-    state.originPattern = saved.originPattern || null;
-    state.relayUrl = saved.relayUrl;
+    state.origin = saved.origin;
+    state.originPattern = saved.originPattern;
+    state.relayUrl = normalizedRelay;
     state.sessionID = saved.sessionID;
     state.keyHex = saved.keyHex;
     state.secretKey = secretKey;
@@ -1035,7 +1100,13 @@ export async function ensureRestored() {
     state.lastError = null;
 
     await ensureWatchdogAlarm();
+    if (state.connGen !== gen || !state.active) {
+      return getPublicState();
+    }
     await setReconnectingBadge(state.tabId);
+    if (state.connGen !== gen || !state.active) {
+      return getPublicState();
+    }
     openRelaySocket({ isInitial: false });
     return getPublicState();
   })().finally(() => {
@@ -1054,9 +1125,14 @@ export {
 
 if (typeof chrome !== "undefined" && chrome.tabs && chrome.runtime) {
   chrome.tabs.onRemoved.addListener((tabId) => {
-    if (state.active && state.tabId === tabId) {
-      stopSharing("Shared tab was closed");
-    }
+    (async () => {
+      if (restoreInFlight) {
+        await restoreInFlight.catch(() => {});
+      }
+      if (state.active && state.tabId === tabId) {
+        await stopSharing("Shared tab was closed");
+      }
+    })();
   });
 
   if (chrome.alarms?.onAlarm) {
@@ -1080,8 +1156,10 @@ if (typeof chrome !== "undefined" && chrome.tabs && chrome.runtime) {
       }
 
       if (msg.type === "GET_STATE") {
-        await loadSavedRelayUrl();
         await ensureRestored();
+        if (!state.active) {
+          await loadSavedRelayUrl();
+        }
         sendResponse(getPublicState());
         return;
       }

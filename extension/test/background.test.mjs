@@ -237,6 +237,13 @@ test("transient disconnect triggers auto-reconnect preserving token, and permane
   const ws2 = MockWebSocket.instances[1];
   ws2.simulateOpen();
 
+  // Verify ws2.sent[0] resends the exact 65-byte authFrame
+  assert.equal(ws1.sent.length >= 1, true);
+  assert.equal(ws2.sent.length >= 1, true);
+  assert.equal(ws2.sent[0].length, 65);
+  assert.equal(ws2.sent[0][0], 0x04);
+  assert.deepEqual(ws2.sent[0], ws1.sent[0]);
+
   const recoveredState = bg.getPublicState();
   assert.equal(recoveredState.active, true);
   assert.equal(recoveredState.connected, true);
@@ -304,4 +311,90 @@ test("ensureRestored recovers session from chrome.storage.session and cleans up 
   assert.equal(afterMissingTab.active, false);
   assert.equal(mockChrome._sessionStore.dtfm_web_active_session, undefined);
   assert.equal(mockChrome._permissions.has("https://bank.example/*"), false);
+});
+
+test("ensureRestored cleans up when host permission was revoked", async () => {
+  await bg.stopSharing(null);
+  MockWebSocket.instances = [];
+  mockChrome._tabs.set(77, { id: 77, windowId: 3, title: "App", url: "https://app.example/", active: true });
+  mockChrome._permissions.delete("https://app.example/*");
+
+  mockChrome._sessionStore.dtfm_web_active_session = {
+    tabId: 77,
+    windowId: 3,
+    tabTitle: "App",
+    tabUrl: "https://app.example/",
+    origin: "https://app.example",
+    originPattern: "https://app.example/*",
+    relayUrl: "wss://relay.dtfm.dev/ws",
+    sessionID: "0123456789abcdef0123456789abcdef",
+    keyHex: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  };
+
+  const res = await bg.ensureRestored();
+  assert.equal(res.active, false);
+  assert.equal(MockWebSocket.instances.length, 0);
+  assert.equal(mockChrome._sessionStore.dtfm_web_active_session, undefined);
+});
+
+test("ensureRestored racing with stopSharing does not resurrect stopped session", async () => {
+  await bg.stopSharing(null);
+  MockWebSocket.instances = [];
+  mockChrome._tabs.set(88, { id: 88, windowId: 4, title: "Portal", url: "https://portal.example/", active: true });
+  mockChrome._permissions.add("https://portal.example/*");
+
+  mockChrome._sessionStore.dtfm_web_active_session = {
+    tabId: 88,
+    windowId: 4,
+    tabTitle: "Portal",
+    tabUrl: "https://portal.example/",
+    origin: "https://portal.example",
+    originPattern: "https://portal.example/*",
+    relayUrl: "wss://relay.dtfm.dev/ws",
+    sessionID: "0123456789abcdef0123456789abcdef",
+    keyHex: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  };
+
+  const restorePromise = bg.ensureRestored();
+  const stopPromise = bg.stopSharing("User stopped");
+  await Promise.all([restorePromise, stopPromise]);
+
+  const finalState = bg.getPublicState();
+  assert.equal(finalState.active, false);
+  assert.equal(MockWebSocket.instances.length, 0);
+  assert.equal(mockChrome._sessionStore.dtfm_web_active_session, undefined);
+});
+
+test("tab closure during reconnect backoff stops sharing and cleans up", async () => {
+  await bg.stopSharing(null);
+  MockWebSocket.instances = [];
+  mockChrome._tabs.set(55, { id: 55, windowId: 5, title: "Tax", url: "https://tax.example/", active: true });
+  mockChrome._permissions.add("https://tax.example/*");
+
+  const startPromise = bg.startSharing({
+    tabId: 55,
+    windowId: 5,
+    tabTitle: "Tax",
+    tabUrl: "https://tax.example/",
+    origin: "https://tax.example",
+    relayUrl: "wss://relay.dtfm.dev/ws",
+  });
+
+  await waitFor(() => MockWebSocket.instances.length >= 1);
+  const ws1 = MockWebSocket.instances[0];
+  ws1.simulateOpen();
+  await startPromise;
+
+  // Trigger transient disconnect -> enters reconnect backoff
+  ws1.simulateClose(1006, "network drop");
+  assert.equal(bg.getPublicState().reconnecting, true);
+
+  // Close the tab while waiting in reconnect backoff
+  mockChrome._tabs.delete(55);
+  await waitFor(() => !bg.getPublicState().active && !mockChrome._permissions.has("https://tax.example/*"), 2500);
+
+  assert.equal(bg.getPublicState().active, false);
+  assert.equal(MockWebSocket.instances.length, 1);
+  assert.equal(mockChrome._sessionStore.dtfm_web_active_session, undefined);
+  assert.equal(mockChrome._alarms.has("dtfm-web-keepalive-watchdog"), false);
 });
